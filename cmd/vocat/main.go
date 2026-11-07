@@ -1580,12 +1580,37 @@ func pollDeviceSnapshots(
 			if !entry.Discovered || entry.Candidate.DiscoveryIssue != "" || (!entry.Candidate.HasATPort() && entry.Candidate.HardwareKind != pcsc.HardwareKind) {
 				continue
 			}
-			// Native 410 firmware can miss physical SIM insertion events. Probe it
-			// every five seconds; retain normal discovery/other modem cadence.
-			if !fullRefresh && provisionedDeviceType(entry.Candidate) != store.DeviceTypeWiFi410 {
+			wifi410 := provisionedDeviceType(entry.Candidate) == store.DeviceTypeWiFi410
+			if !fullRefresh && !wifi410 {
 				continue
 			}
 			entry := entry
+			// WiFi 410 pacing gates (VoCat-crash-analysis-2026-11-07.md
+			// section 7, F1/F4): full snapshots for the 410 run only on
+			// the 30-second full cadence — the pre-v0.3.26 rhythm — and
+			// during the post-modem-restart quiet window even those are
+			// downgraded. In both cases the five-second tick performs
+			// only a cheap QMI card-status probe: no ATI, no snapshot,
+			// no embedded SIM power-cycle recovery.
+			if wifi410 && (!fullRefresh || time.Now().Before(manager.ModemQuietUntil(entry.ID))) {
+				refreshGroup.Add(1)
+				go func() {
+					defer refreshGroup.Done()
+					select {
+					case refreshSlots <- struct{}{}:
+						defer func() { <-refreshSlots }()
+					case <-ctx.Done():
+						return
+					}
+					probeContext, cancelProbe := context.WithTimeout(ctx, 10*time.Second)
+					_, probeErr := manager.ProbeNativeQMICardStatus(probeContext, entry.ID)
+					cancelProbe()
+					if probeErr != nil && ctx.Err() == nil {
+						logger.Debug("modem card status probe failed", "device_id", entry.ID, "error", probeErr)
+					}
+				}()
+				continue
+			}
 			refreshGroup.Add(1)
 			go func() {
 				defer refreshGroup.Done()
@@ -1713,6 +1738,8 @@ type cardPolicyDevices interface {
 	List() []device.Device
 	AcquireSIMRead(context.Context, string) (func(), error)
 	SetFlight(context.Context, string, bool) (device.FlightResult, error)
+	LastModemRestart(string) time.Time
+	SIMRecoveredAt(string) time.Time
 }
 
 type cardPolicyWiFi interface {
@@ -1729,6 +1756,30 @@ type cardPolicyReconciler struct {
 	wifi                    cardPolicyWiFi
 	observedCards           map[string]string
 	wifi410StartupNotBefore time.Time
+}
+
+// vowifiNotBefore returns the earliest time the reconciler may start VoWiFi
+// for a device. For WiFi 410 it is the latest of the cold-start delay, the
+// F1 post-modem-restart quiet window, and the F3 post-profile-switch
+// cooldown (VoCat-crash-analysis-2026-11-07.md section 7). Other device
+// types only ever had the startup value, which shouldDelayWiFi410VoWiFi
+// ignores for them anyway.
+func (r *cardPolicyReconciler) vowifiNotBefore(deviceType, physicalID string) time.Time {
+	notBefore := r.wifi410StartupNotBefore
+	if deviceType != store.DeviceTypeWiFi410 {
+		return notBefore
+	}
+	if restart := r.devices.LastModemRestart(physicalID); !restart.IsZero() {
+		if until := restart.Add(device.WiFi410ModemQuietPeriod); until.After(notBefore) {
+			notBefore = until
+		}
+	}
+	if recovered := r.devices.SIMRecoveredAt(physicalID); !recovered.IsZero() {
+		if until := recovered.Add(device.WiFi410ProfileSwitchCooldown); until.After(notBefore) {
+			notBefore = until
+		}
+	}
+	return notBefore
 }
 
 // reconcile performs one pass so the policy decisions can also be exercised
@@ -1847,7 +1898,7 @@ func (r *cardPolicyReconciler) reconcileDevice(ctx context.Context, configuredID
 		}
 		switch {
 		case stateErr != nil || !state.Enabled:
-			if shouldDelayWiFi410VoWiFi(config.DeviceType, time.Now(), r.wifi410StartupNotBefore) {
+			if shouldDelayWiFi410VoWiFi(config.DeviceType, time.Now(), r.vowifiNotBefore(config.DeviceType, physicalID)) {
 				return
 			}
 			_, _ = r.wifi.RequestEnabled(config.ID, true)

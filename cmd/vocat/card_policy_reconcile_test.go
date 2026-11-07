@@ -14,14 +14,28 @@ import (
 )
 
 type policyReconcileDevices struct {
-	gate       sync.RWMutex
-	mu         sync.Mutex
-	entry      device.Device
-	flights    []bool
-	acquireErr error
-	onAcquire  func()
-	readers    atomic.Int32
-	unsafeRF   atomic.Bool
+	gate             sync.RWMutex
+	mu               sync.Mutex
+	entry            device.Device
+	flights          []bool
+	acquireErr       error
+	onAcquire        func()
+	readers          atomic.Int32
+	unsafeRF         atomic.Bool
+	lastModemRestart time.Time
+	simRecoveredAt   time.Time
+}
+
+func (d *policyReconcileDevices) LastModemRestart(string) time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.lastModemRestart
+}
+
+func (d *policyReconcileDevices) SIMRecoveredAt(string) time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.simRecoveredAt
 }
 
 func (d *policyReconcileDevices) Get(string) (device.Device, error) {
@@ -327,5 +341,40 @@ func TestCardPolicyReconcilePhysicalRemovalDoesNotInterruptMaintenance(t *testin
 	r.reconcile(context.Background())
 	if len(w.enables) != 0 || w.reconnects != 0 || r.observedCards["dev1"] != "old-card" {
 		t.Fatal("temporary disappearance interrupted profile maintenance")
+	}
+}
+
+// TestCardPolicyReconcileWiFi410PacingGates covers the fork's F1/F3 rhythm
+// gates (VoCat-crash-analysis-2026-11-07.md section 7): on a WiFi 410
+// device the reconciler must not start VoWiFi inside the post-modem-restart
+// quiet window or the post-profile-switch cooldown, and must start it once
+// both have passed.
+func TestCardPolicyReconcileWiFi410PacingGates(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		restartAgo  time.Duration // negative means unset
+		recoveredAt time.Duration // negative means unset
+		wantEnables int
+	}{
+		{name: "no pacing timestamps", restartAgo: -1, recoveredAt: -1, wantEnables: 1},
+		{name: "modem restarted just now", restartAgo: 0, recoveredAt: -1, wantEnables: 0},
+		{name: "modem restarted long ago", restartAgo: time.Hour, recoveredAt: -1, wantEnables: 1},
+		{name: "sim recovered just now", restartAgo: -1, recoveredAt: 0, wantEnables: 0},
+		{name: "sim recovered long ago", restartAgo: -1, recoveredAt: time.Hour, wantEnables: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, d, w := newPolicyReconcileFixture(t)
+			d.entry.Snapshot.FlightMode = false
+			if tc.restartAgo >= 0 {
+				d.lastModemRestart = time.Now().Add(-tc.restartAgo)
+			}
+			if tc.recoveredAt >= 0 {
+				d.simRecoveredAt = time.Now().Add(-tc.recoveredAt)
+			}
+			r.reconcile(context.Background())
+			if len(w.enables) != tc.wantEnables {
+				t.Fatalf("enables = %v, want %d call(s)", w.enables, tc.wantEnables)
+			}
+		})
 	}
 }
