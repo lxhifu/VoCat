@@ -675,6 +675,44 @@ func run(logger *slog.Logger, logs *loghub.Hub) error {
 	go handler.StartCellularCallMonitor(pollContext)
 	handler.StartAutomaticTasks(pollContext)
 
+	// Opt-in modem crash recovery: when enabled, a background watcher polls
+	// the modem's remoteproc and triggers the kernel's one-shot recovery
+	// after a confirmed firmware crash (see internal/remoteproc). It runs
+	// on pollContext so it stops with the other background consumers, and
+	// its events go through the regular notification channels and audit
+	// log. Writing to sysfs additionally requires the systemd unit to
+	// grant write access to /sys/class/remoteproc (deploy/vocat.service).
+	if cfg.ModemRecoveryEnabled {
+		notifyRecovery := func(event string) func(context.Context, remoteproc.RecoveryEvent) {
+			return func(ctx context.Context, ev remoteproc.RecoveryEvent) {
+				detail := ev.Reason
+				if ev.Err != nil {
+					detail = ev.Err.Error()
+				}
+				handler.NotifyModemRecovery(ctx, server.ModemRecoveryNotification{
+					Event:      event,
+					RemoteProc: ev.Name,
+					Time:       ev.At,
+					Attempt:    ev.Attempt,
+					Detail:     detail,
+				})
+			}
+		}
+		recoveryWatcher := remoteproc.NewRecoveryWatcher(remoteproc.WatcherConfig{
+			PollInterval:  cfg.ModemRecoveryPollInterval,
+			Settle:        cfg.ModemRecoverySettle,
+			MaxAttempts:   cfg.ModemRecoveryMaxAttempts,
+			AttemptWindow: cfg.ModemRecoveryAttemptWindow,
+			Cooldown:      cfg.ModemRecoveryCooldown,
+		}, remoteproc.RecoveryEvents{
+			OnCrashDetected:     notifyRecovery(server.ModemRecoveryCrashDetected),
+			OnRecoverySucceeded: notifyRecovery(server.ModemRecoverySucceeded),
+			OnRecoveryFailed:    notifyRecovery(server.ModemRecoveryFailed),
+			OnRecoveryGaveUp:    notifyRecovery(server.ModemRecoveryGaveUp),
+		}, logger.With("category", "hardware"))
+		go recoveryWatcher.Run(pollContext)
+	}
+
 	serverConfig := func(handler http.Handler) *http.Server {
 		return &http.Server{
 			Addr:              cfg.Address,

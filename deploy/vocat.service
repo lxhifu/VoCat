@@ -27,7 +27,12 @@ ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
-ReadWritePaths=/opt/vocat/data
+# /sys/class/remoteproc is writable so the opt-in modem crash recovery
+# watcher (modem_recovery_enabled) can write the one-shot "recover" trigger
+# to the modem's remoteproc after a firmware crash. The watcher never
+# changes the recovery policy setting; remove the path again if the
+# watcher stays disabled and the stricter sandbox is preferred.
+ReadWritePaths=/opt/vocat/data /sys/class/remoteproc
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 RestrictRealtime=true
 LockPersonality=true

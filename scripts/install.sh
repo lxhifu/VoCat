@@ -476,7 +476,10 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 # The web/CLI self-updater verifies a release in this directory and atomically
 # renames it over the running binary. Keep the rest of the host read-only.
-ReadWritePaths=/opt/vocat/data /opt/vocat/bin
+# /sys/class/remoteproc is writable so the opt-in modem crash recovery
+# watcher (modem_recovery_enabled) can write the one-shot "recover" trigger
+# after a modem firmware crash; it never changes the recovery policy.
+ReadWritePaths=/opt/vocat/data /opt/vocat/bin /sys/class/remoteproc
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 RestrictRealtime=true
 LockPersonality=true
