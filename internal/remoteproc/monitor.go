@@ -1,5 +1,10 @@
 // Package remoteproc observes the remote processor owning a native WWAN port.
-// It never starts, stops, or changes recovery settings on a remote processor.
+//
+// The passive monitor in this file never starts, stops, or changes recovery
+// settings on a remote processor. Triggering a one-shot recovery after a
+// confirmed firmware crash is a separate, explicitly opt-in watcher
+// (recovery.go); it only ever writes the "recover" trigger value and never
+// touches the recovery policy setting.
 package remoteproc
 
 import (
@@ -7,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +34,11 @@ type history struct {
 	generation   uint64
 	interrupted  bool
 	runningSince time.Time
+	// holdUntil extends the post-recovery gate beyond the built-in settle
+	// interval. The recovery watcher sets it after triggering a recovery so
+	// device clients stay away while the modem firmware settles for longer
+	// than the passive debounce.
+	holdUntil time.Time
 }
 
 type monitor struct {
@@ -55,13 +66,10 @@ func newMonitor(sysRoot string) *monitor {
 // that SIM initialization has completed; existing readiness checks still apply.
 func CheckPort(port string) (Observation, error) { return system.checkPort(port) }
 
-func (m *monitor) checkPort(port string) (Observation, error) {
-	name := filepath.Base(port)
-	if !strings.HasPrefix(name, "wwan") {
-		return Observation{}, nil
-	}
-	// AT and QMI ports of the same wwanN device share one owner, even when
-	// one class symlink disappears during recovery before its first AT access.
+// wwanKey groups the AT and QMI ports of one wwanN device: they share one
+// owner, even when one class symlink disappears during recovery before its
+// first AT access.
+func wwanKey(name string) string {
 	key := name
 	end := len("wwan")
 	for end < len(name) && name[end] >= '0' && name[end] <= '9' {
@@ -70,15 +78,23 @@ func (m *monitor) checkPort(port string) (Observation, error) {
 	if end > len("wwan") {
 		key = name[:end]
 	}
+	return key
+}
+
+// ownerForPort applies the same sysfs topology walk as checkPort: only an
+// ancestor of this WWAN port is considered (remoteproc0 may be Wi-Fi). It
+// returns the port's topology key and the owner's sysfs class path, or an
+// empty owner when sysfs does not expose a matching processor.
+func (m *monitor) ownerForPort(name string) (key, owner string) {
+	key = wwanKey(name)
 	devicePath, err := m.resolve(filepath.Join(m.sysRoot, "class", "wwan", name))
 	if err != nil {
-		return m.missingTopology(key)
+		return key, ""
 	}
 	entries, err := os.ReadDir(filepath.Join(m.sysRoot, "class", "remoteproc"))
 	if err != nil {
-		return m.missingTopology(key)
+		return key, ""
 	}
-	owner := ""
 	ownerDepth := 0
 	for _, entry := range entries {
 		classPath := filepath.Join(m.sysRoot, "class", "remoteproc", entry.Name())
@@ -91,6 +107,66 @@ func (m *monitor) checkPort(port string) (Observation, error) {
 			owner, ownerDepth = classPath, len(parent)
 		}
 	}
+	return key, owner
+}
+
+// modemOwners returns the sysfs class paths of every remote processor that
+// owns a WWAN port. Owners remembered from earlier port checks are included:
+// their class symlinks may disappear while the modem is down, which is
+// exactly when the recovery watcher still needs to find them.
+func (m *monitor) modemOwners() []string {
+	set := make(map[string]struct{})
+	if entries, err := os.ReadDir(filepath.Join(m.sysRoot, "class", "wwan")); err == nil {
+		for _, entry := range entries {
+			if _, owner := m.ownerForPort(entry.Name()); owner != "" {
+				set[owner] = struct{}{}
+			}
+		}
+	}
+	m.mu.Lock()
+	for _, owner := range m.portOwners {
+		if owner != "" {
+			set[owner] = struct{}{}
+		}
+	}
+	m.mu.Unlock()
+	owners := make([]string, 0, len(set))
+	for owner := range set {
+		owners = append(owners, owner)
+	}
+	sort.Strings(owners)
+	return owners
+}
+
+// setRecoveryHold records that the processor at path has just been triggered
+// to recover: it stays gated until the given time even if the passive settle
+// interval would let clients back in sooner. The bookkeeping mirrors the
+// crash branch of checkPort — the interruption is marked and the generation
+// bumped once, so existing clients are rebuilt after the hold expires.
+func (m *monitor) setRecoveryHold(path string, until time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	item := m.seen[path]
+	if item == nil {
+		item = &history{generation: 1}
+		m.seen[path] = item
+	}
+	if !item.interrupted {
+		item.generation++
+		item.interrupted = true
+		item.runningSince = time.Time{}
+	}
+	if until.After(item.holdUntil) {
+		item.holdUntil = until
+	}
+}
+
+func (m *monitor) checkPort(port string) (Observation, error) {
+	name := filepath.Base(port)
+	if !strings.HasPrefix(name, "wwan") {
+		return Observation{}, nil
+	}
+	key, owner := m.ownerForPort(name)
 	if owner == "" {
 		return m.missingTopology(key)
 	}
@@ -132,10 +208,17 @@ func (m *monitor) checkPort(port string) (Observation, error) {
 			if item.runningSince.IsZero() {
 				item.runningSince = now
 			}
-			if now.Sub(item.runningSince) < m.settle {
+			gate := item.runningSince.Add(m.settle)
+			if item.holdUntil.After(gate) {
+				gate = item.holdUntil
+			}
+			if now.Before(gate) {
 				return obs, fmt.Errorf("%w: waiting for stable running state after recovery", ErrUnavailable)
 			}
 			item.interrupted = false
+			item.holdUntil = time.Time{}
+		} else if m.now().Before(item.holdUntil) {
+			return obs, fmt.Errorf("%w: waiting for stable running state after recovery", ErrUnavailable)
 		}
 	default:
 		if item.interrupted {
