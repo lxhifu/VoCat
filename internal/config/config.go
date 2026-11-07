@@ -25,6 +25,16 @@ type Config struct {
 	MaxRequestBodyBytes int64
 	MCPEnabled          bool
 	ProbeUnknownUSB     bool
+	// Modem crash recovery watcher. Disabled by default: when enabled, vocat
+	// polls the modem's remoteproc and writes "recover" after a confirmed
+	// firmware crash (see internal/remoteproc). It never changes the
+	// remoteproc recovery policy setting itself.
+	ModemRecoveryEnabled       bool
+	ModemRecoveryPollInterval  time.Duration
+	ModemRecoverySettle        time.Duration
+	ModemRecoveryMaxAttempts   int
+	ModemRecoveryAttemptWindow time.Duration
+	ModemRecoveryCooldown      time.Duration
 }
 
 type fileConfig struct {
@@ -33,14 +43,20 @@ type fileConfig struct {
 	// Retain the legacy keys only so upgrades do not reject an existing config
 	// file. They are deliberately ignored: administrator credentials are read
 	// exclusively from SQLite.
-	LegacyAdminUsername *string `json:"admin_username"`
-	LegacyAdminPassword *string `json:"admin_password"`
-	SessionTTL          *string `json:"session_ttl"`
-	SecureCookies       *bool   `json:"secure_cookies"`
-	ShutdownTimeout     *string `json:"shutdown_timeout"`
-	MaxRequestBodyBytes *int64  `json:"max_request_body_bytes"`
-	MCPEnabled          *bool   `json:"mcp_enabled"`
-	ProbeUnknownUSB     *bool   `json:"probe_unknown_usb"`
+	LegacyAdminUsername        *string `json:"admin_username"`
+	LegacyAdminPassword        *string `json:"admin_password"`
+	SessionTTL                 *string `json:"session_ttl"`
+	SecureCookies              *bool   `json:"secure_cookies"`
+	ShutdownTimeout            *string `json:"shutdown_timeout"`
+	MaxRequestBodyBytes        *int64  `json:"max_request_body_bytes"`
+	MCPEnabled                 *bool   `json:"mcp_enabled"`
+	ProbeUnknownUSB            *bool   `json:"probe_unknown_usb"`
+	ModemRecoveryEnabled       *bool   `json:"modem_recovery_enabled"`
+	ModemRecoveryPollInterval  *string `json:"modem_recovery_poll_interval"`
+	ModemRecoverySettle        *string `json:"modem_recovery_settle"`
+	ModemRecoveryMaxAttempts   *int    `json:"modem_recovery_max_attempts"`
+	ModemRecoveryAttemptWindow *string `json:"modem_recovery_attempt_window"`
+	ModemRecoveryCooldown      *string `json:"modem_recovery_cooldown"`
 }
 
 // Default returns the non-secret process configuration. Administrator
@@ -56,6 +72,15 @@ func Default() Config {
 		// The MCP endpoint is authenticated by a bearer token and mounted
 		// by default; operators who do not want it set VOCAT_MCP_ENABLED=false.
 		MCPEnabled: true,
+		// The recovery watcher stays off until an operator opts in: writing
+		// to sysfs also requires the systemd unit to grant write access to
+		// /sys/class/remoteproc (see deploy/vocat.service).
+		ModemRecoveryEnabled:       false,
+		ModemRecoveryPollInterval:  10 * time.Second,
+		ModemRecoverySettle:        90 * time.Second,
+		ModemRecoveryMaxAttempts:   3,
+		ModemRecoveryAttemptWindow: time.Hour,
+		ModemRecoveryCooldown:      5 * time.Minute,
 	}
 }
 
@@ -147,6 +172,40 @@ func applyFile(cfg *Config, values fileConfig) error {
 	if values.ProbeUnknownUSB != nil {
 		cfg.ProbeUnknownUSB = *values.ProbeUnknownUSB
 	}
+	if values.ModemRecoveryEnabled != nil {
+		cfg.ModemRecoveryEnabled = *values.ModemRecoveryEnabled
+	}
+	if values.ModemRecoveryPollInterval != nil {
+		duration, err := time.ParseDuration(*values.ModemRecoveryPollInterval)
+		if err != nil {
+			return fmt.Errorf("modem_recovery_poll_interval: %w", err)
+		}
+		cfg.ModemRecoveryPollInterval = duration
+	}
+	if values.ModemRecoverySettle != nil {
+		duration, err := time.ParseDuration(*values.ModemRecoverySettle)
+		if err != nil {
+			return fmt.Errorf("modem_recovery_settle: %w", err)
+		}
+		cfg.ModemRecoverySettle = duration
+	}
+	if values.ModemRecoveryMaxAttempts != nil {
+		cfg.ModemRecoveryMaxAttempts = *values.ModemRecoveryMaxAttempts
+	}
+	if values.ModemRecoveryAttemptWindow != nil {
+		duration, err := time.ParseDuration(*values.ModemRecoveryAttemptWindow)
+		if err != nil {
+			return fmt.Errorf("modem_recovery_attempt_window: %w", err)
+		}
+		cfg.ModemRecoveryAttemptWindow = duration
+	}
+	if values.ModemRecoveryCooldown != nil {
+		duration, err := time.ParseDuration(*values.ModemRecoveryCooldown)
+		if err != nil {
+			return fmt.Errorf("modem_recovery_cooldown: %w", err)
+		}
+		cfg.ModemRecoveryCooldown = duration
+	}
 	return nil
 }
 
@@ -202,6 +261,48 @@ func applyEnvironment(cfg *Config) error {
 		}
 		cfg.ProbeUnknownUSB = enabled
 	}
+	if value, ok := os.LookupEnv("VOCAT_MODEM_RECOVERY_ENABLED"); ok {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("VOCAT_MODEM_RECOVERY_ENABLED: %w", err)
+		}
+		cfg.ModemRecoveryEnabled = enabled
+	}
+	if value, ok := os.LookupEnv("VOCAT_MODEM_RECOVERY_POLL_INTERVAL"); ok {
+		duration, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("VOCAT_MODEM_RECOVERY_POLL_INTERVAL: %w", err)
+		}
+		cfg.ModemRecoveryPollInterval = duration
+	}
+	if value, ok := os.LookupEnv("VOCAT_MODEM_RECOVERY_SETTLE"); ok {
+		duration, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("VOCAT_MODEM_RECOVERY_SETTLE: %w", err)
+		}
+		cfg.ModemRecoverySettle = duration
+	}
+	if value, ok := os.LookupEnv("VOCAT_MODEM_RECOVERY_MAX_ATTEMPTS"); ok {
+		attempts, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("VOCAT_MODEM_RECOVERY_MAX_ATTEMPTS: %w", err)
+		}
+		cfg.ModemRecoveryMaxAttempts = attempts
+	}
+	if value, ok := os.LookupEnv("VOCAT_MODEM_RECOVERY_ATTEMPT_WINDOW"); ok {
+		duration, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("VOCAT_MODEM_RECOVERY_ATTEMPT_WINDOW: %w", err)
+		}
+		cfg.ModemRecoveryAttemptWindow = duration
+	}
+	if value, ok := os.LookupEnv("VOCAT_MODEM_RECOVERY_COOLDOWN"); ok {
+		duration, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("VOCAT_MODEM_RECOVERY_COOLDOWN: %w", err)
+		}
+		cfg.ModemRecoveryCooldown = duration
+	}
 	return nil
 }
 
@@ -228,6 +329,21 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.MaxRequestBodyBytes < 1024 || cfg.MaxRequestBodyBytes > 10<<20 {
 		return errors.New("max_request_body_bytes must be between 1024 and 10485760")
+	}
+	if cfg.ModemRecoveryPollInterval < time.Second || cfg.ModemRecoveryPollInterval > 5*time.Minute {
+		return errors.New("modem_recovery_poll_interval must be between 1s and 5m")
+	}
+	if cfg.ModemRecoverySettle < 0 || cfg.ModemRecoverySettle > 10*time.Minute {
+		return errors.New("modem_recovery_settle must be between 0s and 10m")
+	}
+	if cfg.ModemRecoveryMaxAttempts < 1 || cfg.ModemRecoveryMaxAttempts > 10 {
+		return errors.New("modem_recovery_max_attempts must be between 1 and 10")
+	}
+	if cfg.ModemRecoveryAttemptWindow < time.Minute || cfg.ModemRecoveryAttemptWindow > 24*time.Hour {
+		return errors.New("modem_recovery_attempt_window must be between 1m and 24h")
+	}
+	if cfg.ModemRecoveryCooldown < 0 || cfg.ModemRecoveryCooldown > cfg.ModemRecoveryAttemptWindow {
+		return errors.New("modem_recovery_cooldown must be between 0s and modem_recovery_attempt_window")
 	}
 	return nil
 }

@@ -20,6 +20,12 @@ var configEnvironment = []string{
 	"VOCAT_MAX_REQUEST_BODY_BYTES",
 	"VOCAT_MCP_ENABLED",
 	"VOCAT_PROBE_UNKNOWN_USB",
+	"VOCAT_MODEM_RECOVERY_ENABLED",
+	"VOCAT_MODEM_RECOVERY_POLL_INTERVAL",
+	"VOCAT_MODEM_RECOVERY_SETTLE",
+	"VOCAT_MODEM_RECOVERY_MAX_ATTEMPTS",
+	"VOCAT_MODEM_RECOVERY_ATTEMPT_WINDOW",
+	"VOCAT_MODEM_RECOVERY_COOLDOWN",
 }
 
 func clearConfigEnvironment(t *testing.T) {
@@ -166,5 +172,65 @@ func TestMCPEnabledEnvironmentOverride(t *testing.T) {
 	t.Setenv("VOCAT_MCP_ENABLED", "maybe")
 	if _, err := Load(); err == nil {
 		t.Fatal("invalid VOCAT_MCP_ENABLED accepted")
+	}
+}
+
+func TestModemRecoveryDefaultsAndOverrides(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModemRecoveryEnabled {
+		t.Fatal("modem recovery watcher must be opt-in")
+	}
+	if cfg.ModemRecoveryPollInterval != 10*time.Second ||
+		cfg.ModemRecoverySettle != 90*time.Second ||
+		cfg.ModemRecoveryMaxAttempts != 3 ||
+		cfg.ModemRecoveryAttemptWindow != time.Hour ||
+		cfg.ModemRecoveryCooldown != 5*time.Minute {
+		t.Fatalf("unexpected recovery defaults: %+v", cfg)
+	}
+
+	path := filepath.Join(t.TempDir(), "vocat.json")
+	if err := os.WriteFile(path, []byte(`{
+		"modem_recovery_enabled": true,
+		"modem_recovery_poll_interval": "15s",
+		"modem_recovery_settle": "2m",
+		"modem_recovery_max_attempts": 2,
+		"modem_recovery_attempt_window": "30m",
+		"modem_recovery_cooldown": "1m"
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VOCAT_CONFIG", path)
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ModemRecoveryEnabled || cfg.ModemRecoveryPollInterval != 15*time.Second ||
+		cfg.ModemRecoverySettle != 2*time.Minute || cfg.ModemRecoveryMaxAttempts != 2 ||
+		cfg.ModemRecoveryAttemptWindow != 30*time.Minute || cfg.ModemRecoveryCooldown != time.Minute {
+		t.Fatalf("file values not applied: %+v", cfg)
+	}
+
+	t.Setenv("VOCAT_MODEM_RECOVERY_ENABLED", "false")
+	t.Setenv("VOCAT_MODEM_RECOVERY_MAX_ATTEMPTS", "4")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModemRecoveryEnabled || cfg.ModemRecoveryMaxAttempts != 4 {
+		t.Fatalf("environment override not applied: %+v", cfg)
+	}
+
+	t.Setenv("VOCAT_MODEM_RECOVERY_MAX_ATTEMPTS", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("modem_recovery_max_attempts=0 accepted")
+	}
+	t.Setenv("VOCAT_MODEM_RECOVERY_MAX_ATTEMPTS", "3")
+	t.Setenv("VOCAT_MODEM_RECOVERY_COOLDOWN", "not-a-duration")
+	if _, err := Load(); err == nil {
+		t.Fatal("invalid VOCAT_MODEM_RECOVERY_COOLDOWN accepted")
 	}
 }
