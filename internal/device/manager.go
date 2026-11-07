@@ -64,6 +64,8 @@ type Manager struct {
 	nativeQMIRegistrationInFlight map[string]struct{}
 	nativeQMISIMRecoveryMu        sync.Mutex
 	nativeQMISIMRecoveries        map[string]time.Time
+	simNotReadyMu                 sync.Mutex
+	simNotReadyStreak             map[string]int
 
 	started      bool
 	devices      map[string]*managedDevice
@@ -156,6 +158,11 @@ type managedDevice struct {
 	resetClientOnLock    bool
 	remoteprocOwner      string
 	remoteprocGeneration uint64
+	// lastModemRestart is when the owning remote processor last changed
+	// generation (F1 quiet window anchor); simRecoveredAt is when the last
+	// post-profile-switch SIM recovery succeeded (F3 cooldown anchor).
+	lastModemRestart     time.Time
+	simRecoveredAt       time.Time
 	resetATProfileOnLock bool
 	simPIN               string
 }
@@ -202,6 +209,7 @@ func NewManager(options Options) (*Manager, error) {
 		qmiDataOpener:                 openQMIDataSession,
 		atHostDataLink:                newATHostDataLink(),
 		nativeQMIRegistrationInFlight: make(map[string]struct{}),
+		simNotReadyStreak:             make(map[string]int),
 		networkEventSubscribers:       make(map[chan string]struct{}),
 		deviceEventSubscribers:        make(map[chan DeviceLifecycleEvent]struct{}),
 		smsArrivals:                   smsArrivals,
@@ -661,6 +669,12 @@ func (manager *Manager) clientLocked(
 		state.preFlightMode = nil
 		state.remoteprocOwner = observation.Path
 		state.remoteprocGeneration = observation.Generation
+		// A generation change means the modem firmware restarted (crash
+		// recovery, hot-swap, or the first observation after process
+		// start). Anchor the F1 pacing quiet window at this moment.
+		manager.mu.Lock()
+		state.lastModemRestart = time.Now()
+		manager.mu.Unlock()
 	}
 	if state.client != nil {
 		if poisoned, ok := state.client.(modem.PoisonedClient); ok && poisoned.Poisoned() {

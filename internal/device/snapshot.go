@@ -205,7 +205,8 @@ func (manager *Manager) readSnapshotWithOperatorProfile(
 			}
 		}
 	}
-	if !snapshot.SIMReady && isNativeQMICandidate(candidate) {
+	if !snapshot.SIMReady && isNativeQMICandidate(candidate) &&
+		manager.snapshotHotSwapRecoveryAllowed(id, candidate) {
 		recoveryContext, cancelRecovery := context.WithTimeout(ctx, 12*time.Second)
 		recovered, recoveryErr := manager.recoverNativeQMIHotSwap(recoveryContext, candidate)
 		cancelRecovery()
@@ -431,6 +432,11 @@ func (manager *Manager) readSnapshotWithOperatorProfile(
 			snapshot.FlightMode = isRadioOffMode(mode)
 			snapshot.RadioOff = snapshot.FlightMode
 		}
+	}
+
+	if snapshot.SIMReady {
+		// A ready SIM clears the F2 consecutive-not-ready streak.
+		manager.resetSIMNotReadyStreak(id)
 	}
 
 	phone, warnings := manager.readPhoneNumber(ctx, client)

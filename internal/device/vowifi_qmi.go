@@ -61,7 +61,8 @@ func (manager *Manager) ReadNativeQMIIdentity(ctx context.Context, id string) (i
 		var recovered bool
 		if iccid, recovered, err = readVoWiFiNativeQMIICCID(ctx, session); err != nil {
 			control, _, _ := manager.nativeQMIControl(id)
-			hotSwapRecovered, recoveryErr := manager.recoverNativeQMIHotSwapSession(ctx, control, session)
+			hotSwapRecovered, recoveryErr := manager.recoverNativeQMIHotSwapSessionPaced(ctx, control, session,
+				hotSwapRecoveryMinInterval(manager.isWiFi410Device(id)))
 			if !hotSwapRecovered {
 				return fmt.Errorf("read QMI ICCID: %w", errors.Join(err, recoveryErr))
 			}

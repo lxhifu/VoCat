@@ -1505,6 +1505,11 @@ func (manager *Manager) recoverAfterProfileSwitch(ctx context.Context, id string
 		if err == nil {
 			err = waitNativeQMIRecovery(ctx, time.Second)
 		}
+		if err == nil {
+			// F3: remember when the SIM came back so the VoWiFi
+			// reconciler can hold AKA off for the cooldown window.
+			manager.markSIMRecovered(id)
+		}
 		// Native WWAN identity and profile verification are both QMI-backed.
 		// Do not enter the AT refresh path: OpenStick firmware can accept the
 		// switch while timing out every EC20-specific AT identity command.
@@ -1517,7 +1522,11 @@ func (manager *Manager) recoverAfterProfileSwitch(ctx context.Context, id string
 		resetErr = manager.softResetForProfileSwitch(resetContext, id)
 		cancelReset()
 	}
-	return errors.Join(resetErr, manager.refreshAfterProfileSwitchContext(ctx, id))
+	err := errors.Join(resetErr, manager.refreshAfterProfileSwitchContext(ctx, id))
+	if err == nil {
+		manager.markSIMRecovered(id)
+	}
+	return err
 }
 
 // refreshAfterProfileSwitch repopulates the device snapshot in the background
@@ -1547,11 +1556,10 @@ func (manager *Manager) refreshAfterProfileSwitchContext(parent context.Context,
 		}
 		return fmt.Errorf("esim: refresh reader after profile recovery: %w", lastErr)
 	}
-	const (
-		settle   = 1 * time.Second
-		interval = 1 * time.Second
-		attempts = 5
-	)
+	const attempts = 5
+	// F5: on WiFi 410 the settle/interval widen to 5s so the post-switch
+	// refresh attempts do not pile onto the settling firmware.
+	settle, interval := profileSwitchRefreshPacing(manager.isWiFi410Device(id))
 	if err := waitNativeQMIRecovery(parent, settle); err != nil {
 		return err
 	}
@@ -1673,7 +1681,9 @@ func (manager *Manager) canVerifyProfileSwitchWithoutRestart(id string) bool {
 // is finalized by REFRESH/reset. The UI must not report success until the modem
 // is actually exposing the requested ICCID.
 func (manager *Manager) verifySwitchedICCID(ctx context.Context, id, expected string) error {
-	return manager.verifySwitchedICCIDAttempts(ctx, id, expected, 6, 1*time.Second)
+	// F5: WiFi 410 verification attempts are spaced 5s apart instead of 1s.
+	return manager.verifySwitchedICCIDAttempts(ctx, id, expected, 6,
+		profileSwitchVerifyInterval(manager.isWiFi410Device(id)))
 }
 
 func (manager *Manager) verifySwitchedICCIDAttempts(

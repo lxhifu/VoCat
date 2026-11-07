@@ -100,7 +100,8 @@ func (manager *Manager) recoverNativeQMIHotSwap(ctx context.Context, candidate m
 		return false, err
 	}
 	defer session.Close()
-	return manager.recoverNativeQMIHotSwapSession(ctx, candidate.QMIControl, session)
+	return manager.recoverNativeQMIHotSwapSessionPaced(ctx, candidate.QMIControl, session,
+		hotSwapRecoveryMinInterval(isWiFi410Candidate(candidate)))
 }
 
 // A 410 may latch UIM error 6 after a physical swap, even after reinsertion.
@@ -109,6 +110,13 @@ func (manager *Manager) recoverNativeQMIHotSwap(ctx context.Context, candidate m
 // The QMI session owns the control-node lease throughout this transaction, so
 // it cannot interrupt another UIM logical-channel transaction.
 func (manager *Manager) recoverNativeQMIHotSwapSession(ctx context.Context, control string, radio qmiRadioSession) (bool, error) {
+	return manager.recoverNativeQMIHotSwapSessionPaced(ctx, control, radio, nativeQMISIMRecoveryMinInterval)
+}
+
+// recoverNativeQMIHotSwapSessionPaced is recoverNativeQMIHotSwapSession
+// with a caller-selected minimum interval between power cycles (F2 raises
+// it to 120s on WiFi 410).
+func (manager *Manager) recoverNativeQMIHotSwapSessionPaced(ctx context.Context, control string, radio qmiRadioSession, minInterval time.Duration) (bool, error) {
 	session, ok := radio.(nativeQMIHotSwapSession)
 	if !ok {
 		return false, nil
@@ -123,7 +131,7 @@ func (manager *Manager) recoverNativeQMIHotSwapSession(ctx context.Context, cont
 	// A removed card can keep reporting error 6. Limit power cycles, while
 	// continuing cheap status probes so a normally inserted card appears fast.
 	manager.nativeQMISIMRecoveryMu.Lock()
-	if time.Since(manager.nativeQMISIMRecoveries[control]) < 15*time.Second {
+	if time.Since(manager.nativeQMISIMRecoveries[control]) < minInterval {
 		manager.nativeQMISIMRecoveryMu.Unlock()
 		return false, nil
 	}
